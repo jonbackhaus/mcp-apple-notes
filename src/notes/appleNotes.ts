@@ -22,6 +22,13 @@ function run(argv) {
     try { return d ? d.toISOString() : null; } catch (e) { return null; }
   }
 
+  function describeError(e) {
+    var parts = [];
+    try { parts.push(String(e)); } catch (x) {}
+    try { if (e && e.errorNumber != null) parts.push('errorNumber ' + e.errorNumber); } catch (x) {}
+    return parts.join(' ') || 'unknown Notes automation error';
+  }
+
   function processFolder(folder, accountName) {
     if (limit > 0 && results.length >= limit) return;
     var fname = '';
@@ -68,7 +75,16 @@ function run(argv) {
   }
 
   var accounts = [];
-  try { accounts = Notes.accounts(); } catch (e) { accounts = []; }
+  try {
+    accounts = Notes.accounts();
+  } catch (e) {
+    // Top-level authorization failure (e.g. Apple Event -1743 when Automation
+    // access is denied). Emit a structured sentinel instead of swallowing to []
+    // so the caller can distinguish "denied" from "empty library" and raise
+    // NotesPermissionError. Per-folder/per-note reads below still swallow so one
+    // locked folder cannot abort the whole read.
+    return JSON.stringify({ __error: describeError(e) });
+  }
   for (var a = 0; a < accounts.length; a++) {
     if (limit > 0 && results.length >= limit) break;
     var acctName = '';
@@ -90,11 +106,23 @@ export class NotesPermissionError extends Error {
   }
 }
 
+/**
+ * Runs the JXA script under `osascript` and resolves its raw stdout. Injectable
+ * so tests can feed canned output without touching the real Notes app.
+ */
+export type OsascriptRunner = (limit: string) => Promise<string>;
+
 /** Reads notes from the local Apple Notes app via `osascript`. */
 export class AppleNotesSource implements NotesSource {
   readonly name = "Apple Notes (osascript)";
+  private readonly runner: OsascriptRunner;
 
-  constructor(private readonly timeoutMs: number = 120_000) {}
+  constructor(
+    private readonly timeoutMs: number = 120_000,
+    runner?: OsascriptRunner,
+  ) {
+    this.runner = runner ?? ((limit) => this.runOsascript(limit));
+  }
 
   async fetchNotes(options: FetchOptions = {}): Promise<RawNote[]> {
     const limit = options.limit && options.limit > 0 ? String(options.limit) : "0";
@@ -102,7 +130,7 @@ export class AppleNotesSource implements NotesSource {
 
     let stdout: string;
     try {
-      stdout = await this.runOsascript(limit);
+      stdout = await this.runner(limit);
     } catch (err) {
       throw this.translateError(err);
     }
@@ -116,6 +144,17 @@ export class AppleNotesSource implements NotesSource {
       throw new Error(
         `Failed to parse osascript output as JSON: ${(err as Error).message}`,
       );
+    }
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && "__error" in parsed) {
+      // The JXA script emits this sentinel when the top-level Notes.accounts()
+      // call fails (e.g. Apple Event -1743 when Automation access is denied).
+      // Route it through translateError so a denial raises NotesPermissionError
+      // with System Settings guidance instead of masquerading as an empty library.
+      const detail = String((parsed as { __error?: unknown }).__error ?? "unknown error");
+      const sentinelError = Object.assign(new Error(`Notes automation failed: ${detail}`), {
+        stderr: detail,
+      });
+      throw this.translateError(sentinelError);
     }
     if (!Array.isArray(parsed)) {
       throw new Error("osascript did not return a JSON array of notes");
