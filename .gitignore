@@ -17,3 +17,8 @@ data/
 # Model cache (transformers.js)
 .cache/
 .model-cache/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key
+.beads/proxieddb/
